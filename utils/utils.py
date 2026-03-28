@@ -2,7 +2,10 @@ import os
 import socket
 from datetime import datetime
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import torch
 
 from utils.constants import MISTRAL, LLAMA

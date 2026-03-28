@@ -2,7 +2,10 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 from torch.nn import MSELoss
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import numpy as np
 import os
 import time
@@ -10,22 +13,39 @@ import os
 import copy
 import warnings
 from datasets import Dataset
-from peft import PeftModel
+try:
+    from peft import PeftModel
+except Exception:
+    PeftModel = None
 from transformers import TrainerCallback
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import numpy as np
 import time
 import os
 import copy
 from transformers import Trainer
 from typing import Any, Dict, Union
-from trl import SFTTrainer
+try:
+    from trl import SFTTrainer
+except Exception:
+    class SFTTrainer:  # type: ignore[override]
+        def __init__(self, *args, **kwargs):
+            raise ImportError("trl is required to use SparseSFTTTrainer.")
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import flash_gemv
-import seaborn as sns
+try:
+    import flash_gemv
+except Exception:
+    flash_gemv = None
+try:
+    import seaborn as sns
+except Exception:
+    sns = None
 
 # from experiments.models.sparse_silu.utils import get_mlp_class, get_decoder_class
 
@@ -515,9 +535,11 @@ class MistralSparseSiluMLP(MistralMLP):
         start_time = time.time()
         pre_activation = pre_activation.float().cpu().detach()
         post_activation = post_activation.float().cpu().detach()
-        # self.histogram_bins=self.histogram_bins.to(pre_activation.device).type(pre_activation.dtype)
-        self.pre_act_hist_counts += torch.histogram(pre_activation, bins=self.histogram_bins)[0]
-        self.post_act_hist_counts += torch.histogram(torch.abs(post_activation), bins=self.histogram_bins)[0]
+        bins = self.histogram_bins.float().cpu()
+        self.pre_act_hist_counts += torch.histogram(pre_activation, bins=bins)[0].to(self.pre_act_hist_counts.dtype)
+        self.post_act_hist_counts += torch.histogram(torch.abs(post_activation), bins=bins)[0].to(
+            self.post_act_hist_counts.dtype
+        )
         # self.post_act_hist_counts += torch.histogram(post_activation, bins=self.histogram_bins)[0]
         self.t += time.time() - start_time
         # if self.visit_counts % 30 == 0:
@@ -539,6 +561,8 @@ class MistralSparseSiluMLP(MistralMLP):
         if self.is_profile:
             if x.shape[1] == 1:
                 if self.sp_method == 1:
+                    if flash_gemv is None:
+                        raise ImportError("flash_gemv is required for profile sparse kernels.")
                     return flash_gemv.flag_gemv_gemv_inner_bf16(
                         x,
                         self.gate_proj.weight,
@@ -547,6 +571,8 @@ class MistralSparseSiluMLP(MistralMLP):
                         self.dead_threshold,
                     )
                 elif self.sp_method == 2:
+                    if flash_gemv is None:
+                        raise ImportError("flash_gemv is required for profile sparse kernels.")
                     return flash_gemv.gemv_gemv_triton(
                         x,
                         self.act_fn(self.gate_proj(x)),
@@ -853,9 +879,11 @@ class LlamaSparseSiluMLP(LlamaMLP):
         start_time = time.time()
         pre_activation = pre_activation.float().cpu().detach()
         post_activation = post_activation.float().cpu().detach()
-        # self.histogram_bins=self.histogram_bins.to(pre_activation.device).type(pre_activation.dtype)
-        self.pre_act_hist_counts += torch.histogram(pre_activation, bins=self.histogram_bins)[0]
-        self.post_act_hist_counts += torch.histogram(torch.abs(post_activation), bins=self.histogram_bins)[0]
+        bins = self.histogram_bins.float().cpu()
+        self.pre_act_hist_counts += torch.histogram(pre_activation, bins=bins)[0].to(self.pre_act_hist_counts.dtype)
+        self.post_act_hist_counts += torch.histogram(torch.abs(post_activation), bins=bins)[0].to(
+            self.post_act_hist_counts.dtype
+        )
         # self.post_act_hist_counts += torch.histogram(post_activation, bins=self.histogram_bins)[0]
         self.t += time.time() - start_time
         # if self.visit_counts % 30 == 0:
@@ -877,6 +905,8 @@ class LlamaSparseSiluMLP(LlamaMLP):
         if self.is_profile:
             if x.shape[1] == 1:
                 if self.sp_method == 1:
+                    if flash_gemv is None:
+                        raise ImportError("flash_gemv is required for profile sparse kernels.")
                     return flash_gemv.flag_gemv_gemv_inner_bf16(
                         x,
                         self.gate_proj.weight,
@@ -885,6 +915,8 @@ class LlamaSparseSiluMLP(LlamaMLP):
                         self.dead_threshold,
                     )
                 elif self.sp_method == 2:
+                    if flash_gemv is None:
+                        raise ImportError("flash_gemv is required for profile sparse kernels.")
                     return flash_gemv.gemv_gemv_triton(
                         x,
                         self.act_fn(self.gate_proj(x)),

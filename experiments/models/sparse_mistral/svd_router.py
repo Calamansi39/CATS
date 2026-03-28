@@ -5,7 +5,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import os
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 import gc
 
 from scipy.sparse.linalg import svds
