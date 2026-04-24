@@ -57,6 +57,7 @@ from utils.utils import (
     get_model_type,
     get_model_type_from_name,
 )
+from utils.linear_input_stats import record_linear_input_stats
 from utils.constants import MISTRAL
 from transformers.configuration_utils import PretrainedConfig
 
@@ -226,6 +227,14 @@ def disable_sparse_silu(model):
     for i, layer in enumerate(model.model.layers):
         if isinstance(layer.mlp, SparseMLP):
             layer.mlp.kill_sparse_swish_outputs = False
+
+
+def set_arc_quant_bridge(model, bridge):
+    SparseMLP = get_mlp_class(model)
+    for layer_idx, layer in enumerate(model.model.layers):
+        if isinstance(layer.mlp, SparseMLP):
+            layer.mlp.arc_quant_bridge = bridge
+            layer.mlp.layer_idx = layer_idx
 
 
 def print_dead_neuron_stats(model):
@@ -520,8 +529,19 @@ class MistralSparseSiluMLP(MistralMLP):
 
         # Sparse activation function
         self.sparse_act_fn = SparseSiLU(threshold=self.dead_threshold)
+        self.arc_quant_bridge = None
+        self.layer_idx = None
 
     def activate_stats(self, is_collect_histogram: bool = True):
+        if getattr(self.histogram_bins, "is_meta", False):
+            num_bins = 1000
+            self.histogram_bins = torch.linspace(-1, 1, num_bins - 2)
+            self.histogram_bins = torch.cat(
+                [torch.tensor([-torch.inf]), self.histogram_bins, torch.tensor([torch.inf])]
+            )
+            self.pre_act_hist_counts = torch.zeros(num_bins - 1)
+            self.abs_post_act_hist_counts = torch.zeros(num_bins - 1)
+            self.post_act_hist_counts = torch.zeros(num_bins - 1)
         self.is_stats = True
         self.dead_percentage = 0
         self.visit_counts = 0
@@ -610,7 +630,17 @@ class MistralSparseSiluMLP(MistralMLP):
 
         else:
             self.count += 1
-            pre_act = self.gate_proj(x)
+            gate_key = f"layers.{self.layer_idx}.mlp.gate_proj.input"
+            up_key = f"layers.{self.layer_idx}.mlp.up_proj.input"
+            down_key = f"layers.{self.layer_idx}.mlp.down_proj.input"
+            record_linear_input_stats(f"layer_{self.layer_idx}.gate", x)
+            record_linear_input_stats(f"layer_{self.layer_idx}.up", x)
+            if self.arc_quant_bridge is not None:
+                pre_act = self.arc_quant_bridge.linear(x, self.gate_proj.weight, self.gate_proj.bias, gate_key)
+                up_out = self.arc_quant_bridge.linear(x, self.up_proj.weight, self.up_proj.bias, up_key)
+            else:
+                pre_act = self.gate_proj(x)
+                up_out = self.up_proj(x)
             post_act = self.act_fn(pre_act)
             if self.kill_sparse_swish_outputs:
                 dead_neurons = post_act.abs() <= self.dead_threshold
@@ -634,7 +664,12 @@ class MistralSparseSiluMLP(MistralMLP):
 
                 post_act[dead_neurons] = 0
 
-            out = self.down_proj(post_act * self.up_proj(x))
+            down_inp = post_act * up_out
+            record_linear_input_stats(f"layer_{self.layer_idx}.down", down_inp)
+            if self.arc_quant_bridge is not None:
+                out = self.arc_quant_bridge.linear(down_inp, self.down_proj.weight, self.down_proj.bias, down_key)
+            else:
+                out = self.down_proj(down_inp)
             if self.use_sparse_regularization:
                 if self.regularization_type == "L1 regularization":
                     self.activation_norm = torch.abs(post_act)[
@@ -864,8 +899,19 @@ class LlamaSparseSiluMLP(LlamaMLP):
 
         # Sparse activation function
         self.sparse_act_fn = SparseSiLU(threshold=self.dead_threshold)
+        self.arc_quant_bridge = None
+        self.layer_idx = None
 
     def activate_stats(self, is_collect_histogram: bool = True):
+        if getattr(self.histogram_bins, "is_meta", False):
+            num_bins = 1000
+            self.histogram_bins = torch.linspace(-1, 1, num_bins - 2)
+            self.histogram_bins = torch.cat(
+                [torch.tensor([-torch.inf]), self.histogram_bins, torch.tensor([torch.inf])]
+            )
+            self.pre_act_hist_counts = torch.zeros(num_bins - 1)
+            self.abs_post_act_hist_counts = torch.zeros(num_bins - 1)
+            self.post_act_hist_counts = torch.zeros(num_bins - 1)
         self.is_stats = True
         self.dead_percentage = 0
         self.visit_counts = 0
@@ -954,7 +1000,17 @@ class LlamaSparseSiluMLP(LlamaMLP):
 
         else:
             self.count += 1
-            pre_act = self.gate_proj(x)
+            gate_key = f"layers.{self.layer_idx}.mlp.gate_proj.input"
+            up_key = f"layers.{self.layer_idx}.mlp.up_proj.input"
+            down_key = f"layers.{self.layer_idx}.mlp.down_proj.input"
+            record_linear_input_stats(f"layer_{self.layer_idx}.gate", x)
+            record_linear_input_stats(f"layer_{self.layer_idx}.up", x)
+            if self.arc_quant_bridge is not None:
+                pre_act = self.arc_quant_bridge.linear(x, self.gate_proj.weight, self.gate_proj.bias, gate_key)
+                up_out = self.arc_quant_bridge.linear(x, self.up_proj.weight, self.up_proj.bias, up_key)
+            else:
+                pre_act = self.gate_proj(x)
+                up_out = self.up_proj(x)
             post_act = self.act_fn(pre_act)
             if self.kill_sparse_swish_outputs:
                 dead_neurons = post_act.abs() <= self.dead_threshold
@@ -977,7 +1033,12 @@ class LlamaSparseSiluMLP(LlamaMLP):
 
                 post_act[dead_neurons] = 0
 
-            out = self.down_proj(post_act * self.up_proj(x))
+            down_inp = post_act * up_out
+            record_linear_input_stats(f"layer_{self.layer_idx}.down", down_inp)
+            if self.arc_quant_bridge is not None:
+                out = self.arc_quant_bridge.linear(down_inp, self.down_proj.weight, self.down_proj.bias, down_key)
+            else:
+                out = self.down_proj(down_inp)
             if self.use_sparse_regularization:
                 if self.regularization_type == "L1 regularization":
                     self.activation_norm = torch.abs(post_act)[

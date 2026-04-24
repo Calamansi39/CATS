@@ -5,7 +5,7 @@ import os
 import sys
 
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM, MistralConfig, MistralForCausalLM
 
@@ -23,9 +23,17 @@ from experiments.models.sparse_silu.ugly_utils import (  # noqa: E402
     enable_sparse_silu,
     get_sparse_config,
     print_dead_neuron_stats,
+    set_arc_quant_bridge,
     set_sparse_threshold,
 )
 from utils.constants import MISTRAL  # noqa: E402
+from utils.linear_input_stats import (  # noqa: E402
+    LinearInputStatsLogger,
+    clear_linear_input_stats_logger,
+    dump_linear_input_stats_logger,
+    record_linear_input_stats,
+    set_linear_input_stats_logger,
+)
 from utils.utils import get_model_type_from_name  # noqa: E402
 
 
@@ -42,6 +50,17 @@ def parse_dtype(dtype: str):
 
 def first_device(model):
     return next(model.parameters()).device
+
+
+def load_wikitext_split(split: str):
+    cache_dir = (
+        "/home/wmq/.cache/huggingface/datasets/wikitext/"
+        "wikitext-2-raw-v1/0.0.0/b08601e04326c79dfdd32d625aee71d232d685c3"
+    )
+    arrow_path = os.path.join(cache_dir, f"wikitext-{split}.arrow")
+    if os.path.isfile(arrow_path):
+        return Dataset.from_file(arrow_path)
+    return load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
 
 
 def load_cats_sparse_model(model_path: str, dtype: str, attn_implementation: str):
@@ -73,7 +92,10 @@ def load_cats_sparse_model(model_path: str, dtype: str, attn_implementation: str
     )
     model.eval()
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False, local_files_only=True)
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = "right"
@@ -88,7 +110,7 @@ def collect_hist_for_threshold(
     max_length: int,
     batch_size: int,
 ):
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+    dataset = load_wikitext_split(split)
     texts = []
     for row in dataset:
         text = row["text"]
@@ -116,7 +138,7 @@ def collect_hist_for_threshold(
 
 
 def build_eval_token_ids(tokenizer, split: str, max_samples: int):
-    dataset = load_dataset("wikitext", "wikitext-2-raw-v1", split=split)
+    dataset = load_wikitext_split(split)
     ids = []
     used = 0
     eos = tokenizer.eos_token_id
@@ -134,6 +156,27 @@ def build_eval_token_ids(tokenizer, split: str, max_samples: int):
         if max_samples > 0 and used >= max_samples:
             break
     return torch.tensor(ids, dtype=torch.long)
+
+
+def attach_attention_input_hooks(model):
+    handles = []
+    proj_map = {"q_proj": "q", "k_proj": "k", "v_proj": "v", "o_proj": "o"}
+    for layer_idx, layer in enumerate(model.model.layers):
+        for module_name, short_name in proj_map.items():
+            module = getattr(layer.self_attn, module_name)
+
+            def _make_hook(idx, proj):
+                def _hook(_module, inputs):
+                    if not inputs:
+                        return
+                    x = inputs[0]
+                    if torch.is_tensor(x):
+                        record_linear_input_stats(f"layer_{idx}.{proj}", x.detach())
+
+                return _hook
+
+            handles.append(module.register_forward_pre_hook(_make_hook(layer_idx, short_name)))
+    return handles
 
 
 def eval_ppl_from_ids(model, token_ids, context_size: int, window_size: int):
@@ -213,11 +256,32 @@ def main():
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--eval_max_length", type=int, default=2048)
+    parser.add_argument("--skip_lm_eval", action="store_true")
+    parser.add_argument("--arc_saved_dir", type=str, default=None)
+    parser.add_argument("--arc_dataset", type=str, default="wikitext2")
+    parser.add_argument("--arc_metric", type=str, default="max")
+    parser.add_argument("--arc_quant_type", type=str, default="NVFP4")
+    parser.add_argument("--stats_json", type=str, default=None)
+    parser.add_argument("--skip_dense_ppl", action="store_true")
     args = parser.parse_args()
 
     model, tokenizer = load_cats_sparse_model(
         args.model_path, args.dtype, args.attn_implementation
     )
+    bridge = None
+    if args.arc_saved_dir:
+        arc_model_dir = os.path.abspath(os.path.join(ROOT, "..", "ARCQuant", "model"))
+        if arc_model_dir not in sys.path:
+            sys.path.append(arc_model_dir)
+        from bridge import ArcQuantBridge
+
+        bridge = ArcQuantBridge.from_saved(
+            model_name=args.model_path,
+            saved_dir=args.arc_saved_dir,
+            dataset=args.arc_dataset,
+            metric=args.arc_metric,
+            quant_type=args.arc_quant_type,
+        )
 
     # 1) Collect histogram stats and set threshold for targeted sparsity.
     collect_hist_for_threshold(
@@ -231,28 +295,48 @@ def main():
     set_sparse_threshold(model, args.sparsity, use_relu=False)
     deactivate_stats(model)
 
-    # 2) PPL (dense path: disable CATS sparse masking)
     token_ids = build_eval_token_ids(tokenizer, args.ppl_split, args.ppl_samples)
-    disable_sparse_silu(model)
-    dense_ppl = eval_ppl_from_ids(model, token_ids, args.context_size, args.window_size)
+    dense_ppl = None
+    if not args.skip_dense_ppl:
+        # 2) PPL (dense path: disable CATS sparse masking)
+        disable_sparse_silu(model)
+        dense_ppl = eval_ppl_from_ids(model, token_ids, args.context_size, args.window_size)
 
     # 3) PPL + measured sparsity (sparse path)
+    if bridge is not None:
+        set_arc_quant_bridge(model, bridge)
     enable_sparse_silu(model)
     activate_stats(model, is_collect_histogram=False)
+    attn_handles = []
+    if args.stats_json:
+        set_linear_input_stats_logger(
+            LinearInputStatsLogger(
+                args.stats_json,
+                seq_len=args.context_size + args.window_size,
+            )
+        )
+        attn_handles = attach_attention_input_hooks(model)
     sparse_ppl = eval_ppl_from_ids(model, token_ids, args.context_size, args.window_size)
+    for handle in attn_handles:
+        handle.remove()
+    if args.stats_json:
+        dump_linear_input_stats_logger()
+        clear_linear_input_stats_logger()
     measured_total_sparsity, layer_sparsities = print_dead_neuron_stats(model)
     deactivate_stats(model)
 
     # 4) Zero-shot benchmark
-    eval_results = run_lm_eval(
-        model,
-        tokenizer,
-        args.tasks,
-        args.limit,
-        args.eval_batch_size,
-        args.eval_max_length,
-        args.dtype,
-    )
+    eval_results = {}
+    if not args.skip_lm_eval:
+        eval_results = run_lm_eval(
+            model,
+            tokenizer,
+            args.tasks,
+            args.limit,
+            args.eval_batch_size,
+            args.eval_max_length,
+            args.dtype,
+        )
 
     summary = {
         "model": args.model_path,
